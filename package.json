@@ -1,0 +1,29 @@
+{
+  "name": "account-buy-bot",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "dev": "node --watch index.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "devDependencies": {
+    "@types/bun": "latest",
+    "nodemon": "^3.1.7"
+  },
+  "dependencies": {
+    "@mtproto/core": "^6.3.0",
+    "axios": "^1.9.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.21.1",
+    "fomautils": "^1.0.2",
+    "mongoose": "^8.7.3",
+    "queue-promise": "^2.2.1",
+    "telegraf": "^4.16.3",
+    "telegram": "^2.26.2"
+  }
+}
