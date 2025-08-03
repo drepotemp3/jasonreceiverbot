@@ -9,6 +9,12 @@ const getMainKeyboard = require("./helpers/getMainKeyboard");
 
 const bot = new Telegraf(process.env.BOT_TOKEN);
 bot.use(session());
+
+bot.use((ctx, next) => {
+  if (!ctx.session) ctx.session = {};
+  return next();
+});
+
 global.bot = bot;
 
 const app = express();
@@ -170,6 +176,125 @@ const withdrawChoice = async (ctx, method) => {
 
 bot.action("PM_binance", (ctx) => withdrawChoice(ctx, "binance"));
 bot.action("PM_trx", (ctx) => withdrawChoice(ctx, "trx"));
+
+bot.command("update_wallet", async (ctx) => {
+  const u = await User.findOne({ chatId: ctx.from.id });
+  const isFa = u.language === "persian";
+  const keyboard = Markup.inlineKeyboard([
+    [Markup.button.callback("Binance", "UW_binance")],
+    [Markup.button.callback("TRX", "UW_trx")],
+    [Markup.button.callback("TON", "UW_ton")],
+  ]);
+
+  await ctx.reply(
+    isFa ? "یک روش را انتخاب کنید:" : "Select a method:",
+    keyboard
+  );
+});
+
+["binance", "trx", "ton"].forEach((method) => {
+  bot.action(`UW_${method}`, async (ctx) => {
+    const u = await User.findOne({ chatId: ctx.from.id });
+    const isFa = u.language === "persian";
+    ctx.session.expectWalletUpdate = method;
+
+    let prompt;
+    if (method === "binance") {
+      prompt = isFa
+        ? "لطفاً شناسه جدید Binance خود را ارسال کنید:"
+        : "Please send your new Binance ID:";
+    } else {
+      prompt = isFa
+        ? `لطفاً آدرس جدید ${method.toUpperCase()} خود را ارسال کنید:`
+        : `Please send your new ${method.toUpperCase()} wallet address:`;
+    }
+
+    await ctx.editMessageText(prompt);
+  });
+});
+
+bot.on("text", async (ctx) => {
+  const session = ctx.session || {};
+  const u = await User.findOne({ chatId: ctx.from.id });
+  const isFa = u.language === "persian";
+
+  // Handle updating address
+  if (session.expectAddr) {
+    const fieldMap = {
+      binance: "addressBinance",
+      trx: "addressTRX",
+      ton: "addressTON",
+    };
+    const field = fieldMap[session.expectAddr];
+
+    u[field] = ctx.message.text.trim();
+    await u.save();
+
+    const confirmationText = isFa
+      ? `${session.expectAddr.toUpperCase()} با موفقیت ذخیره شد.`
+      : `${session.expectAddr.toUpperCase()} address saved.`;
+
+    await ctx.reply(confirmationText);
+    delete ctx.session.expectAddr;
+
+    // Resend menu (no hello)
+    const menuText = isFa
+      ? `موجودی شما هنوز *${u.balance}* است.`
+      : `Your balance is still *${u.balance}* for now.`;
+
+    const keyboard = Markup.inlineKeyboard([
+      [Markup.button.callback(isFa ? "🌐 زبان" : "🌐 Language", "LANG")],
+      [
+        Markup.button.callback(
+          isFa ? "📤 آپلود حساب" : "📤 Upload Account",
+          "UPLOAD"
+        ),
+      ],
+      [Markup.button.callback(isFa ? "💸 برداشت" : "💸 Withdraw", "WITHDRAW")],
+    ]);
+
+    await ctx.replyWithMarkdownV2(menuText, keyboard);
+    return;
+  }
+
+  if (session.expectWalletUpdate) {
+    const field = {
+      binance: "addressBinance",
+      trx: "addressTRX",
+      ton: "addressTON",
+    }[session.expectWalletUpdate];
+
+    u[field] = ctx.message.text.trim();
+    await u.save();
+
+    await ctx.reply(
+      isFa
+        ? `${session.expectWalletUpdate.toUpperCase()} با موفقیت ذخیره شد.`
+        : `${session.expectWalletUpdate.toUpperCase()} address saved successfully.`
+    );
+
+    delete ctx.session.expectWalletUpdate;
+
+    // resend menu (no hello)
+    const menuText = isFa
+      ? `موجودی شما هنوز *${u.balance}* است.`
+      : `Your balance is still *${u.balance}* for now.`;
+
+    const keyboard = Markup.inlineKeyboard([
+      [Markup.button.callback(isFa ? "🌐 زبان" : "🌐 Language", "LANG")],
+      [
+        Markup.button.callback(
+          isFa ? "📤 آپلود حساب" : "📤 Upload Account",
+          "UPLOAD"
+        ),
+      ],
+      [Markup.button.callback(isFa ? "💸 برداشت" : "💸 Withdraw", "WITHDRAW")],
+    ]);
+
+    return sendWrapped(() => ctx.replyWithMarkdown(menuText, keyboard));
+  }
+});
+
 bot.action("PM_ton", (ctx) => withdrawChoice(ctx, "ton"));
 
 bot.on("text", async (ctx) => {
@@ -256,7 +381,8 @@ bot.on("text", async (ctx) => {
 });
 
 bot.telegram.setMyCommands([
-  { command: "/start", description: "Start the bot" },
+  { command: "start", description: "Start the bot" },
+  { command: "update_wallet", description: "Update wallet address" },
 ]);
 
 app.get("/ping", async (req, res) => {
