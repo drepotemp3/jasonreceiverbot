@@ -2,18 +2,15 @@ require("dotenv/config");
 const express = require("express");
 const mongoose = require("mongoose");
 const cors = require("cors");
-const { Telegraf, Markup } = require("telegraf");
+const { Telegraf, Markup, session } = require("telegraf");
 const Queue = require("queue-promise");
 const connectDb = require("./db/connectDb");
 const getMainKeyboard = require("./helpers/getMainKeyboard");
+
 const bot = new Telegraf(process.env.BOT_TOKEN);
+bot.use(session());
 global.bot = bot;
 
-// Queue configuration for bot commands
-const queue = new Queue({
-  concurrent: 30,
-  interval: 1000,
-});
 const app = express();
 
 // throttle queue: up to 25 messages/sec → interval ≈ 40 ms, concurrency 1
@@ -72,7 +69,6 @@ bot.start(requireJoin, async (ctx) => {
   }
 
   sendWrapped(() => ctx.reply(menuText, getMainKeyboard(user.language)));
-
 });
 
 // language selector
@@ -96,47 +92,80 @@ bot.action(/SETLANG_(.+)/, async (ctx) => {
   const menuText = `${u.language === "persian" ? "خوش آمدید" : "Hello"} ${
     u.name
   }\nYour balance is $${u.balance}`;
+  const isFa = u.language === "persian";
+
   const keyboard = Markup.inlineKeyboard([
+    [Markup.button.callback(isFa ? "🌐 زبان" : "🌐 Language", "LANG")],
     [
       Markup.button.callback(
-        u.language === "persian" ? "زبان" : "Language",
-        "LANG"
+        isFa ? "📤 آپلود حساب" : "📤 Upload Account",
+        "UPLOAD"
       ),
     ],
-    [Markup.button.callback("Upload Account", "UPLOAD")],
-    [Markup.button.callback("Withdraw", "WITHDRAW")],
+    [Markup.button.callback(isFa ? "💸 برداشت" : "💸 Withdraw", "WITHDRAW")],
   ]);
+
   sendWrapped(() => ctx.reply(menuText, keyboard));
 });
 
 // Withdraw flow
 bot.action("WITHDRAW", async (ctx) => {
-  const u = await User.findOne({ chatId: ctx.from.id });
-  const kn = Markup.inlineKeyboard([
+  const user = await User.findOne({ chatId: ctx.from.id });
+  if (!user) return ctx.reply("User not found.");
+
+  const isFa = user.language === "persian";
+  const message = isFa
+    ? `موجودی شما: $${user.balance}\nروش پرداخت را انتخاب کنید`
+    : `Your balance: $${user.balance}\nSelect payment method`;
+
+  const keyboard = Markup.inlineKeyboard([
     [Markup.button.callback("Binance", "PM_binance")],
     [Markup.button.callback("TRX", "PM_trx")],
     [Markup.button.callback("TON", "PM_ton")],
   ]);
-  await ctx.editMessageText(
-    `Your balance: $${u.balance}\nSelect payment method`,
-    kn
-  );
+
+  try {
+    await ctx.editMessageText(message, keyboard);
+  } catch (e) {
+    // fallback to sending a new message if edit fails (e.g. stale message)
+    await ctx.reply(message, keyboard);
+  }
 });
 
 const withdrawChoice = async (ctx, method) => {
   const u = await User.findOne({ chatId: ctx.from.id });
+  const lang = u?.language || "english";
+  const isFa = lang === "persian";
+
   const addrField = {
     binance: "addressBinance",
     trx: "addressTRX",
     ton: "addressTON",
   }[method];
+
   if (!u[addrField]) {
-    await ctx.reply(`Please send your ${method.toUpperCase()} address.`);
+    const addressPrompt = {
+      binance: isFa
+        ? "لطفاً شناسه Binance خود را ارسال کنید."
+        : "Please send your Binance ID.",
+      trx: isFa
+        ? "لطفاً آدرس TRX خود را ارسال کنید."
+        : "Please send your TRX address.",
+      ton: isFa
+        ? "لطفاً آدرس TON خود را ارسال کنید."
+        : "Please send your TON address.",
+    }[method];
+
+    await ctx.reply(addressPrompt);
     ctx.session = { expectAddr: method };
     return;
   }
+
+  const amountPrompt = isFa
+    ? "مقدار برداشت را وارد کنید:"
+    : "Enter withdrawal amount:";
   ctx.session = { expectWithdraw: method };
-  await ctx.reply("Enter withdrawal amount:");
+  await ctx.reply(amountPrompt);
 };
 
 bot.action("PM_binance", (ctx) => withdrawChoice(ctx, "binance"));
@@ -146,40 +175,83 @@ bot.action("PM_ton", (ctx) => withdrawChoice(ctx, "ton"));
 bot.on("text", async (ctx) => {
   const session = ctx.session || {};
   const u = await User.findOne({ chatId: ctx.from.id });
+  const lang = u?.language || "english";
+  const isFa = lang === "persian";
+
+  // handle address input
   if (session.expectAddr) {
+    const method = session.expectAddr;
     const field = {
       binance: "addressBinance",
       trx: "addressTRX",
       ton: "addressTON",
-    }[session.expectAddr];
+    }[method];
+
     u[field] = ctx.message.text.trim();
     await u.save();
-    await ctx.reply(`${session.expectAddr.toUpperCase()} address saved.`);
-    delete ctx.session.expectAddr;
+
+    const confirmationMsg = {
+      binance: isFa ? "شناسه Binance ذخیره شد." : "Binance ID saved.",
+      trx: isFa ? "آدرس TRX ذخیره شد." : "TRX address saved.",
+      ton: isFa ? "آدرس TON ذخیره شد." : "TON address saved.",
+    }[method];
+
+    await ctx.reply(confirmationMsg);
+
+    // move immediately to withdrawal step
+    ctx.session = { expectWithdraw: method };
+    const promptMsg = isFa
+      ? "مقدار برداشت را وارد کنید:"
+      : "Enter withdrawal amount:";
+    await ctx.reply(promptMsg);
     return;
   }
+
+  // handle withdrawal amount
   if (session.expectWithdraw) {
     const amt = parseFloat(ctx.message.text.trim());
-    if (isNaN(amt) || amt > u.balance) {
+    if (isNaN(amt) || amt <= 0) {
       await ctx.reply(
-        u.language === "persian" ? "موجودی ناکافی است" : "Insufficient balance"
+        isFa ? "مقدار معتبر وارد کنید." : "Please enter a valid amount."
       );
-    } else {
-      // register withdrawal request (not detailed here)
-      await ctx.reply(`Request for $${amt} sent, you will be updated in chat.`);
+      return;
     }
+
+    if (amt > u.balance) {
+      await ctx.reply(isFa ? "موجودی ناکافی است" : "Insufficient balance");
+    } else {
+      await ctx.reply(
+        isFa
+          ? `درخواست برداشت $${amt} ثبت شد. به زودی به شما اطلاع داده خواهد شد.`
+          : `Request for $${amt} sent. You will be updated in chat.`
+      );
+      // register withdrawal here if needed
+    }
+
     delete ctx.session.expectWithdraw;
-    // resend menu
-    const menuText = `${u.language === "persian" ? "خوش آمدید" : "Hello"} ${
-      u.name
-    }\nYour balance is $${u.balance}`;
+
+    // resend localized menu
+    const menuText = isFa
+      ? `موجودی شما هنوز *${u.balance}* است.`
+      : `Your balance is still *${u.balance}* for now.`;
+
     const keyboard = Markup.inlineKeyboard([
-      [Markup.button.callback("Language", "LANG")],
-      [Markup.button.callback("Upload Account", "UPLOAD")],
-      [Markup.button.callback("Withdraw", "WITHDRAW")],
+      [Markup.button.callback(isFa ? "🌐 زبان" : "🌐 Language", "LANG")],
+      [
+        Markup.button.callback(
+          isFa ? "📤 آپلود حساب" : "📤 Upload Account",
+          "UPLOAD"
+        ),
+      ],
+      [Markup.button.callback(isFa ? "💸 برداشت" : "💸 Withdraw", "WITHDRAW")],
     ]);
-    sendWrapped(() => ctx.reply(menuText, keyboard));
-    return;
+
+    sendWrapped(() =>
+      ctx.reply(menuText, {
+        parse_mode: "Markdown",
+        ...keyboard,
+      })
+    );
   }
 });
 
