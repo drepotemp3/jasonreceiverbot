@@ -6,6 +6,8 @@ const { Telegraf, Markup, session } = require("telegraf");
 const Queue = require("queue-promise");
 const connectDb = require("./db/connectDb");
 const getMainKeyboard = require("./helpers/getMainKeyboard");
+const sendLanguageSelection = require("./helpers/sendLanguageSelection");
+const User = require("./models/User");
 
 const bot = new Telegraf(process.env.BOT_TOKEN);
 bot.use(session());
@@ -16,23 +18,15 @@ bot.use((ctx, next) => {
 });
 
 global.bot = bot;
+global.channel = null;
+global.admins = [];
 
 const app = express();
 
 // throttle queue: up to 25 messages/sec → interval ≈ 40 ms, concurrency 1
 const msgQueue = new Queue({ concurrent: 1, interval: 40 });
 
-// mongoose user schema
-const userSchema = new mongoose.Schema({
-  chatId: { type: Number, unique: true },
-  name: String,
-  balance: { type: Number, default: 0 },
-  language: { type: String, default: "english" },
-  addressBinance: String,
-  addressTRX: String,
-  addressTON: String,
-});
-const User = mongoose.model("User", userSchema);
+//system schema
 
 // utility to enqueue send/edit
 function sendWrapped(fn) {
@@ -40,79 +34,99 @@ function sendWrapped(fn) {
 }
 
 // middleware: ensure channel membership
-const CHANNEL = process.env.CHANNEL_USERNAME; // e.g. '@yourchannel'
 async function requireJoin(ctx, next) {
   try {
-    const member = await ctx.telegram.getChatMember(CHANNEL, ctx.from.id);
+    const member = await ctx.telegram.getChatMember(
+      global.channel,
+      ctx.from.id
+    );
     const okStatuses = ["member", "creator", "administrator"];
+
     if (!okStatuses.includes(member.status)) {
-      await ctx.reply(`Please join channel ${CHANNEL} to use this bot.`);
+      await ctx.reply(
+        `Please join the channel to use this bot.\n\nلطفاً برای استفاده از ربات، به کانال بپیوندید:\n${global.channel}`
+      );
       return;
     }
   } catch (err) {
     console.error(err);
-    await ctx.reply("Error verifying membership. Try again later.");
+    await ctx.reply(
+      "Error verifying membership. Try again later.\n\nخطا در بررسی عضویت. لطفاً بعداً دوباره امتحان کنید."
+    );
     return;
   }
+
   return next();
 }
 
 bot.start(requireJoin, async (ctx) => {
   const chatId = ctx.from.id;
   let user = await User.findOne({ chatId });
-  let name =
-    ctx.from.username || ctx.from.first_name || ctx.from.last_name || "there";
-  let menuText;
+
   if (user) {
-    const lang = user.language || "english";
-    menuText =
-      lang === "persian"
-        ? `خوش برگشتی ${name}\nموجودی شما: $${user.balance}`
-        : `Welcome back, ${name}\nYour balance is $${user.balance}`;
+    global[ctx.from.id] = { ...global[ctx.from.id], language: user.language };
+    const langText = {
+      fa: "سلام، به ربات دریافت حساب خوش آمدید! 🎊\n\n👉 برای شروع، شماره حساب مجازی مورد نظر را ارسال کنید یا /help را برای راهنما بفرستید.",
+      en: "Hello, welcome to the account receiving bot! 🎊\n\n👉 To start, send the desired virtual account number or send /help to get help.",
+    };
+
+    const isFa = user?.language === "persian";
+
+    await ctx.reply(isFa ? langText.fa : langText.en, {
+      parse_mode: "Markdown",
+      reply_to_message_id: ctx.message.message_id,
+    });
   } else {
     user = await User.create({ chatId, name });
-    menuText = `Hey ${name}, welcome to JasonReceiver bot\nYour balance is $${user.balance}`;
+    sendLanguageSelection(ctx);
   }
-
-  sendWrapped(() => ctx.reply(menuText, getMainKeyboard(user.language)));
 });
 
 // language selector
-bot.action("LANG", async (ctx) => {
-  await ctx.editMessageText(
-    "Select a language\n\nزبان خود را انتخاب کنید",
-    Markup.inlineKeyboard([
-      [Markup.button.callback("🇮🇷 Persian", "SETLANG_persian")],
-      [Markup.button.callback("🇬🇧 English", "SETLANG_english")],
-    ])
-  );
-});
-bot.action(/SETLANG_(.+)/, async (ctx) => {
-  const lang = ctx.match[1];
-  await User.updateOne({ chatId: ctx.from.id }, { language: lang });
-  const u = await User.findOne({ chatId: ctx.from.id });
+bot.command("language", async (ctx) => {
   await ctx.reply(
-    lang === "persian" ? "زبان بروزرسانی شد" : "Language updated"
+    `لطفا زبان موردنظرتان را انتخاب کنید.
+
+Please choose your preferred language.`,
+    Markup.keyboard([["🇮🇷 فارسی", "🌎 English"]])
+      .oneTime()
+      .resize(), {reply_to_message_id:ctx.message.message_id}
   );
-  // resend menu
-  const menuText = `${u.language === "persian" ? "خوش آمدید" : "Hello"} ${
-    u.name
-  }\nYour balance is $${u.balance}`;
-  const isFa = u.language === "persian";
-
-  const keyboard = Markup.inlineKeyboard([
-    [Markup.button.callback(isFa ? "🌐 زبان" : "🌐 Language", "LANG")],
-    [
-      Markup.button.callback(
-        isFa ? "📤 آپلود حساب" : "📤 Upload Account",
-        "UPLOAD"
-      ),
-    ],
-    [Markup.button.callback(isFa ? "💸 برداشت" : "💸 Withdraw", "WITHDRAW")],
-  ]);
-
-  sendWrapped(() => ctx.reply(menuText, keyboard));
 });
+
+bot.on("text", async (ctx) => {
+  const text = ctx.message.text;
+
+  let lang;
+  if (text === "🇮🇷 فارسی") lang = "persian";
+  else if (text === "🌎 English") lang = "english";
+  else return; // Ignore unrelated messages
+
+  try {
+    await User.updateOne({ chatId: ctx.from.id }, { language: lang });
+
+    await ctx.reply(
+      lang === "persian" ? "✅ زبان بروزرسانی شد" : "✅ Language updated",
+      Markup.removeKeyboard()
+    );
+
+const langText = {
+      fa: "سلام، به ربات دریافت حساب خوش آمدید! 🎊\n\n👉 برای شروع، شماره حساب مجازی مورد نظر را ارسال کنید یا /help را برای راهنما بفرستید.",
+      en: "Hello, welcome to the account receiving bot! 🎊\n\n👉 To start, send the desired virtual account number or send /help to get help.",
+    };
+
+    const isFa = lang === "persian";
+
+    await ctx.reply(isFa ? langText.fa : langText.en, {
+      parse_mode: "Markdown",
+      reply_to_message_id: ctx.message.message_id,
+    });
+  } catch (err) {
+    console.error("Language set error:", err);
+    await await ctx.reply(lang == "persian" ? "❌ بروزرسانی زبان انجام نشد." : "❌ Failed to update language.");
+  }
+});
+
 
 // Withdraw flow
 bot.action("WITHDRAW", async (ctx) => {
@@ -192,26 +206,70 @@ bot.command("update_wallet", async (ctx) => {
   );
 });
 
-["binance", "trx", "ton"].forEach((method) => {
-  bot.action(`UW_${method}`, async (ctx) => {
-    const u = await User.findOne({ chatId: ctx.from.id });
-    const isFa = u.language === "persian";
-    ctx.session.expectWalletUpdate = method;
+bot.command("help", async (ctx) => {
+  let text =
+    global[ctx.from.id].language === "persian"
+      ? "👮‍♀️ برای تماس با پشتیبانی:\n\n"
+      : "👮‍♀️ To contact support:\n\n";
 
-    let prompt;
-    if (method === "binance") {
-      prompt = isFa
-        ? "لطفاً شناسه جدید Binance خود را ارسال کنید:"
-        : "Please send your new Binance ID:";
-    } else {
-      prompt = isFa
-        ? `لطفاً آدرس جدید ${method.toUpperCase()} خود را ارسال کنید:`
-        : `Please send your new ${method.toUpperCase()} wallet address:`;
-    }
-
-    await ctx.editMessageText(prompt);
+  let admins = "";
+  global.admins.forEach((e) => {
+    admins += e + "\n";
+  });
+  text += admins;
+  await ctx.reply(text, {
+    reply_to_message_id: ctx.message.message_id,
   });
 });
+
+bot.command("support", async (ctx) => {
+  if (global[ctx.from.id].lang == "persian") {
+    await ctx.reply(
+      `💥 توضیحات لازم در کانال ربات در آدرس زیر قرار دارد:
+
+${global.channel}
+
+📌 اگر پاسخ سوال شما در کانال نبود، می‌توانید با ${
+        global.admins.length > 1 ? global.admins.join(", ") : global.admins[0]
+      } تماس بگیرید`,
+      { reply_to_message_id: ctx.message.message_id }
+    );
+  } else {
+    await ctx.reply(
+      `💥 The explanation required in the robot channel is at the following address:
+
+${global.channel}
+
+📌 If the answer to your question is not in the channel, you can contact ${
+        global.admins.length > 1 ? global.admins.join(", ") : global.admins[0]
+      }`,
+      {
+        reply_to_message_id: ctx.message.message_id,
+      }
+    );
+  }
+});
+
+// [("binance", "trx", "ton")].forEach((method) => {
+//   bot.action(`UW_${method}`, async (ctx) => {
+//     const u = await User.findOne({ chatId: ctx.from.id });
+//     const isFa = u.language === "persian";
+//     ctx.session.expectWalletUpdate = method;
+
+//     let prompt;
+//     if (method === "binance") {
+//       prompt = isFa
+//         ? "لطفاً شناسه جدید Binance خود را ارسال کنید:"
+//         : "Please send your new Binance ID:";
+//     } else {
+//       prompt = isFa
+//         ? `لطفاً آدرس جدید ${method.toUpperCase()} خود را ارسال کنید:`
+//         : `Please send your new ${method.toUpperCase()} wallet address:`;
+//     }
+
+//     await ctx.editMessageText(prompt);
+//   });
+// });
 
 bot.on("text", async (ctx) => {
   const session = ctx.session || {};
@@ -381,9 +439,28 @@ bot.on("text", async (ctx) => {
 });
 
 bot.telegram.setMyCommands([
-  { command: "start", description: "Start the bot" },
-  { command: "update_wallet", description: "Update wallet address" },
+  { command: "start", description: "♻️ شروع " },
+  { command: "help", description: "📚 راهنما " },
+  { command: "language", description: "🌍 زبان " },
+  { command: "support", description: "👩‍💻 پشتیبانی " },
 ]);
+
+bot.catch((err, ctx) => {
+  console.error("Unhandled error occurred", err);
+
+  // Optionally notify the user without exposing internal error details
+  if (ctx && ctx.reply) {
+    ctx.reply("⚠️ An unexpected error occurred. Please try again.");
+  }
+});
+
+process.on("unhandledRejection", (reason, promise) => {
+  console.error("Unhandled Rejection:", reason);
+});
+
+process.on("uncaughtException", (err) => {
+  console.error("Uncaught Exception:", err);
+});
 
 app.get("/ping", async (req, res) => {
   res.status(200).json({ message: "Hello" });

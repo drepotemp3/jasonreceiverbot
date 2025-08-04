@@ -1,7 +1,7 @@
 const mongoose = require("mongoose");
 const launchBot = require("../helpers/launchBot");
+const System = require("../models/System");
 require("dotenv/config");
-
 
 let isConnecting = false;
 
@@ -18,15 +18,25 @@ function connectDb(retryCount = 0) {
     .then(() => {
       console.log("✅ Connected to MongoDB");
       isConnecting = false;
+      
+      //Fetch system info once
+      System.findOne({ admin: true }).then((system) => {
+        global.channel = system.channel;
+        global.admins = system.admins;
+      });
 
       if (!global.isBotLaunched) {
         launchBot(); // ✅ only launch bot once
         global.isBotLaunched = true;
       }
 
+
     })
     .catch((err) => {
-      console.error(`❌ MongoDB connection error (attempt ${retryCount + 1}):`, err.message);
+      console.error(
+        `❌ MongoDB connection error (attempt ${retryCount + 1}):`,
+        err.message
+      );
       isConnecting = false;
 
       const delay = 2000;
